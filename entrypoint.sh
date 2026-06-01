@@ -194,14 +194,20 @@ request_dhcp() {
     if has_ip; then
         return 0
     fi
+
     log "Requesting DHCP lease"
-    udhcpc -i "${VPN_INTERFACE}" -q -n >/tmp/udhcpc.log 2>&1
+
+    udhcpc -i "${VPN_INTERFACE}" -q -n >/dev/null 2>&1
     DHCP_EXIT=$?
+
     if [ ${DHCP_EXIT} -ne 0 ]; then
         err "DHCP failed (exit ${DHCP_EXIT})"
+        udhcpc -i "${VPN_INTERFACE}" -q -n 2>&1 | head -20
         return 1
     fi
+
     sleep 3
+
     if has_ip; then
         IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" | awk '/inet / {print $2}' | head -n1)"
         log "DHCP assigned IP: ${IP_ADDR}"

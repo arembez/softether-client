@@ -233,7 +233,7 @@ wait_until_connected() {
 
 connect_vpn() {
     pin_server_route
-    log "Connecting VPN"
+    log "Connecting VPN | server=${SE_SERVER} | hub=${SE_HUB}"
     vpn AccountConnect "${ACCOUNT_NAME}" >/dev/null || true
     wait_until_connected || return 1
     wait_for_interface || return 1
@@ -266,7 +266,7 @@ reconnect_vpn() {
     done
 }
 
-log "Starting SoftEther VPN Client"
+log "Starting SoftEther VPN Client | version=${SE_VERSION}"
 vpnclient start >/dev/null 2>&1 || true
 sleep 3
 

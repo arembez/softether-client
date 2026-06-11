@@ -91,37 +91,3 @@ docker build -t softether-client .
 ## License
 
 MIT License
-```
-
----
-
-## DockerHub Description
-
-```markdown
-# SoftEther VPN Client
-
-A production‑ready Docker image for the SoftEther VPN Client. Automatically connects to any SoftEther VPN server, obtains an IP via DHCP, and optionally forces all traffic through the tunnel.
-
-**Key features:**
-
-- 🔌 Works with any SoftEther VPN server (L2TP/IPsec, OpenVPN, SSTP, etc.)
-- 🧠 Intelligent route pinning – keeps control connection alive even when default route changes
-- 🩺 Tolerant health check – reconnects only after multiple consecutive failures
-- 🚦 Optional default route enforcement – set `SE_DEFAULTROUTE=1` to route all traffic through VPN
-- 🔇 Silent DHCP – no `udhcpc` or `mv: can't rename` log spam
-- 🐳 Runs with `NET_ADMIN` capability (no need for full `privileged` mode)
-
-**Quick run:**
-
-```bash
-docker run -d --cap-add=NET_ADMIN \
-  -e SE_SERVER=vpn.example.com:443 \
-  -e SE_HUB=VPNHUB \
-  -e SE_NICNAME=myvpn \
-  -e SE_USERNAME=myuser \
-  -e SE_PASSWORD=mypass \
-  -e SE_DEFAULTROUTE=1 \
-  arembez/softether-client:latest
-```
-
-See the [GitHub repository](https://github.com/arembez/softether-client) for full documentation and docker-compose examples.

@@ -43,6 +43,7 @@ UPLINK_DEV=""
 VPN_SERVER_IP=""
 VPN_GW=""
 DEFAULT_ROUTE_LOGGED=false
+UPLINK_POLICY_LOGGED=false
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*"
@@ -123,13 +124,53 @@ pin_server_route() {
     fi
 }
 
+setup_uplink_policy() {
+    [ -z "${UPLINK_GW}" ] && return 1
+    [ -z "${UPLINK_DEV}" ] && return 1
+
+    CONTAINER_IP="$(ip -4 addr show "${UPLINK_DEV}" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)"
+    if [ -z "${CONTAINER_IP}" ]; then
+        warn "Cannot detect container IP on ${UPLINK_DEV}, policy routing skipped"
+        return 1
+    fi
+
+    RT_TABLES="/etc/iproute2/rt_tables"
+    if [ ! -f "${RT_TABLES}" ]; then
+        mkdir -p "$(dirname "${RT_TABLES}")"
+        touch "${RT_TABLES}"
+    fi
+
+    TABLE_NAME="original_uplink"
+    TABLE_ID=200
+
+    if ! grep -q "^${TABLE_ID} ${TABLE_NAME}" "${RT_TABLES}" 2>/dev/null; then
+        echo "${TABLE_ID} ${TABLE_NAME}" >> "${RT_TABLES}"
+    fi
+
+    if ! ip route show table "${TABLE_NAME}" | grep -q '^default'; then
+        ip route add default via "${UPLINK_GW}" dev "${UPLINK_DEV}" table "${TABLE_NAME}"
+    fi
+
+    if ! ip rule show | grep -Fq "from ${CONTAINER_IP} lookup ${TABLE_NAME}"; then
+        ip rule add from "${CONTAINER_IP}" lookup "${TABLE_NAME}" priority 1000 >/dev/null 2>&1
+    fi
+
+    if [ "${UPLINK_POLICY_LOGGED}" = false ]; then
+        log "Uplink policy routing configured: from ${CONTAINER_IP} via ${UPLINK_GW} dev ${UPLINK_DEV} table ${TABLE_NAME}"
+        UPLINK_POLICY_LOGGED=true
+    fi
+}
+
 ensure_default_route() {
     [ -z "${VPN_GW}" ] && return 1
+
+    setup_uplink_policy
+
     ip route show | grep '^default' | while read -r route; do
         if echo "$route" | grep -q "dev ${VPN_INTERFACE}\>"; then
             continue
         else
-            log "Removing invalid default route: $route"
+            log "Remove redundant default route: $route"
             ip route del $route 2>/dev/null || true
         fi
     done
@@ -274,7 +315,7 @@ reconnect_vpn() {
     done
 }
 
-log "Starting SoftEther VPN Client | deployment version=${SE_VERSION}"
+log "Starting SoftEther VPN Client | deployment v${SE_VERSION}"
 if ! vpnclient start >/dev/null 2>&1; then
     err "Failed to start vpnclient"
     exit 1

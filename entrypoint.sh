@@ -266,7 +266,7 @@ reconnect_vpn() {
     done
 }
 
-log "Starting SoftEther VPN Client | version=${SE_VERSION}"
+log "Starting SoftEther VPN Client | deployment version=${SE_VERSION}"
 vpnclient start >/dev/null 2>&1 || true
 sleep 3
 
@@ -307,16 +307,16 @@ while true; do
     ELAPSED=$((NOW - STABILIZE_START))
     STATE=""
     if ! is_connected; then
-        STATE="vpn reconnecting"
+        STATE="Connection lost"
     elif ! interface_exists; then
-        STATE="interface missing"
+        STATE="Interface missing"
     elif ! has_ip; then
-        STATE="waiting for ip"
-    elif [ -n "${VPN_GW}" ] && ping -c 1 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
+        STATE="Waiting for ip"
+    elif [ -n "${VPN_GW}" ] && ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
         log "Tunnel stabilized | gateway=${VPN_GW} | elapsed=${ELAPSED}s"
         break
     else
-        STATE="waiting for gateway"
+        STATE="Waiting for gateway"
     fi
     if [ "${STATE}" != "${LAST_STATE}" ] || [ $((ELAPSED % 30)) -eq 0 ]; then
         log "Tunnel stabilizing | state=${STATE} | elapsed=${ELAPSED}s"
@@ -330,41 +330,66 @@ while true; do
 done
 
 log "Healthcheck started"
+
 FAIL_COUNT=0
-LAST_HEALTH_STATE="healthy"
+LAST_HEALTH_STATE="Healthy"
+
 while true; do
-  CURRENT_STATE="healthy"
-  if ! is_connected; then
-      CURRENT_STATE="vpn disconnected"
-  elif ! interface_exists; then
-      CURRENT_STATE="interface missing"
-  elif ! has_ip; then
-      CURRENT_STATE="ip lost"
-  elif [ -n "${VPN_GW}" ] && ! ping -c 1 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
-      CURRENT_STATE="gateway unreachable"
-  fi
-  if [ "${CURRENT_STATE}" != "healthy" ]; then
-      FAIL_COUNT=$((FAIL_COUNT + 1))
-      if [ "${CURRENT_STATE}" != "${LAST_HEALTH_STATE}" ]; then
-          err "${CURRENT_STATE}"
-      fi
-      if [ "${FAIL_COUNT}" -ge "${HEALTHCHECK_FAILURES}" ]; then
-          warn "Health check failed ${FAIL_COUNT} times, reconnecting VPN"
-          reconnect_vpn
-          FAIL_COUNT=0
-          sleep "${PING_INTERVAL}"
-          continue
-      fi
-  else
-      if [ "${LAST_HEALTH_STATE}" != "healthy" ]; then
-          log "VPN connection restored"
-      fi
-      FAIL_COUNT=0
-      if [ -n "${SE_DEFAULTROUTE}" ]; then
-          ensure_default_route
-      fi
-      pin_server_route
-  fi
-  LAST_HEALTH_STATE="${CURRENT_STATE}"
-  sleep "${PING_INTERVAL}"
+    CURRENT_STATE="Healthy"
+
+    if ! is_connected; then
+        CURRENT_STATE="Connection lost"
+    elif ! interface_exists; then
+        CURRENT_STATE="Interface missing"
+    elif ! has_ip; then
+        CURRENT_STATE="IP address lost"
+    elif [ -n "${VPN_GW}" ] && ! ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
+        CURRENT_STATE="Gateway unreachable"
+    fi
+
+    if [ "${CURRENT_STATE}" != "Healthy" ]; then
+
+        if [ "${CURRENT_STATE}" != "${LAST_HEALTH_STATE}" ]; then
+            FAIL_COUNT=1
+            err "${CURRENT_STATE}"
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+
+        if [ "${CURRENT_STATE}" = "Gateway unreachable" ] \
+           && [ "${FAIL_COUNT}" -eq "${HEALTHCHECK_FAILURES}" ]; then
+            warn "VPN status dump:"
+            vpn AccountStatusGet "${ACCOUNT_NAME}" | while IFS= read -r line; do
+                warn "  ${line}"
+            done
+        fi
+
+        if [ "${FAIL_COUNT}" -ge "${HEALTHCHECK_FAILURES}" ]; then
+            warn "Health check failed ${FAIL_COUNT} times, reconnecting"
+            reconnect_vpn
+
+            FAIL_COUNT=0
+            LAST_HEALTH_STATE="Healthy"
+
+            sleep "${PING_INTERVAL}"
+            continue
+        fi
+
+    else
+
+        if [ "${LAST_HEALTH_STATE}" != "Healthy" ]; then
+            log "Connection restored"
+        fi
+
+        FAIL_COUNT=0
+
+        if [ -n "${SE_DEFAULTROUTE}" ]; then
+            ensure_default_route
+        fi
+
+        pin_server_route
+    fi
+
+    LAST_HEALTH_STATE="${CURRENT_STATE}"
+    sleep "${PING_INTERVAL}"
 done

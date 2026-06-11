@@ -114,7 +114,8 @@ pin_server_route() {
         return 0
     fi
     ip route del "${VPN_SERVER_IP}" >/dev/null 2>&1 || true
-    if ip route add "${VPN_SERVER_IP}" via "${UPLINK_GW}" dev "${UPLINK_DEV}" >/dev/null 2>&1 || true;
+    if ip route add "${VPN_SERVER_IP}" via "${UPLINK_GW}" dev "${UPLINK_DEV}" >/dev/null 2>&1
+    then
         log "Pinned route: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
     else
         warn "Failed route pin: ${VPN_SERVER_IP} via ${UPLINK_DEV}"

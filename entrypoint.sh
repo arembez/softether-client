@@ -189,25 +189,31 @@ request_dhcp() {
 
     log "Requesting DHCP lease"
 
-    udhcpc -i "${VPN_INTERFACE}" -q -n >/dev/null 2>&1
+    DHCP_OUTPUT="$(udhcpc -i "${VPN_INTERFACE}" -q -n 2>&1)"
     DHCP_EXIT=$?
 
     if [ ${DHCP_EXIT} -ne 0 ]; then
         err "DHCP failed (exit ${DHCP_EXIT})"
-        udhcpc -i "${VPN_INTERFACE}" -q -n 2>&1 | head -20
+        echo "${DHCP_OUTPUT}" | head -20 | while IFS= read -r line; do
+            warn "  ${line}"
+        done
         return 1
     fi
 
-    sleep 3
+    sleep 2
 
     if has_ip; then
         IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" | awk '/inet / {print $2}' | head -n1)"
         log "DHCP assigned IP: ${IP_ADDR}"
         return 0
-    else
-        err "DHCP assigned no IP"
-        return 1
     fi
+
+    err "DHCP completed but no IP assigned"
+    echo "${DHCP_OUTPUT}" | head -20 | while IFS= read -r line; do
+        warn "  ${line}"
+    done
+
+    return 1
 }
 
 wait_until_connected() {

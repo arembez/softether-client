@@ -132,7 +132,10 @@ ensure_default_route() {
             ip route del $route 2>/dev/null || true
         fi
     done
-    if ! ip route show | grep '^default' | grep -q "dev ${VPN_INTERFACE}\>"; then
+    if ip route show | grep '^default' | grep -q "dev ${VPN_INTERFACE}\>"; then
+        existing_gw="$(ip route show | grep '^default' | grep "dev ${VPN_INTERFACE}" | awk '{print $3}' | head -n1)"
+        log "Default route already present via VPN gateway ${existing_gw} dev ${VPN_INTERFACE}"
+    else
         log "Adding default route via VPN gateway ${VPN_GW} dev ${VPN_INTERFACE}"
         ip route add default via "${VPN_GW}" dev "${VPN_INTERFACE}" 2>/dev/null || true
     fi

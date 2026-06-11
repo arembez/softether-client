@@ -114,19 +114,11 @@ pin_server_route() {
         return 0
     fi
     ip route del "${VPN_SERVER_IP}" >/dev/null 2>&1 || true
-    ip route add "${VPN_SERVER_IP}" \
-        via "${UPLINK_GW}" \
-        dev "${UPLINK_DEV}" >/dev/null 2>&1 || true
-    log "Pinned route: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
-}
-
-vpn_has_default_route() {
-    ip route show default | grep -q "${VPN_INTERFACE}"
-}
-
-is_host_network() {
-    ip route | grep -q "172.17.0.0/16" && return 1
-    return 0
+    if ip route add "${VPN_SERVER_IP}" via "${UPLINK_GW}" dev "${UPLINK_DEV}" >/dev/null 2>&1 || true;
+        log "Pinned route: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
+    else
+        warn "Failed route pin: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
+    fi
 }
 
 ensure_default_route() {
@@ -267,7 +259,10 @@ reconnect_vpn() {
 }
 
 log "Starting SoftEther VPN Client | deployment version=${SE_VERSION}"
-vpnclient start >/dev/null 2>&1 || true
+if ! vpnclient start >/dev/null 2>&1; then
+    err "Failed to start vpnclient"
+    exit 1
+fi
 sleep 3
 
 detect_uplink

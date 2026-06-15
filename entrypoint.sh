@@ -322,8 +322,8 @@ if ! vpnclient start >/dev/null 2>&1; then
 fi
 sleep 3
 
-detect_uplink
-resolve_vpn_server
+detect_uplink || exit 1
+resolve_vpn_server || exit 1
 
 if adapter_exists; then
     log "Adapter exists: ${SE_NICNAME}"

@@ -1,0 +1,17 @@
+services:
+  softether:
+    build:
+      context: .
+      dockerfile: Dockerfile  
+    container_name: softether
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      SE_SERVER: ${SE_SERVER}
+      SE_HUB: ${SE_HUB}
+      SE_NICNAME: ${SE_NICNAME}
+      SE_USERNAME: ${SE_USERNAME}
+      SE_PASSWORD: ${SE_PASSWORD}
+      SE_DEFAULTROUTE: ${SE_DEFAULTROUTE}
+    restart: unless-stopped

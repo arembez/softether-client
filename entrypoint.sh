@@ -19,11 +19,13 @@
 
 set -u
 
-: "${SE_SERVER:?missing SE_SERVER}"
-: "${SE_HUB:?missing SE_HUB}"
-: "${SE_NICNAME:?missing SE_NICNAME}"
-: "${SE_USERNAME:?missing SE_USERNAME}"
-: "${SE_PASSWORD:?missing SE_PASSWORD}"
+check_env() {
+    : "${SE_SERVER:?missing SE_SERVER}"
+    : "${SE_HUB:?missing SE_HUB}"
+    : "${SE_NICNAME:?missing SE_NICNAME}"
+    : "${SE_USERNAME:?missing SE_USERNAME}"
+    : "${SE_PASSWORD:?missing SE_PASSWORD}"
+}
 
 PING_INTERVAL="${PING_INTERVAL:-10}"
 PING_TIMEOUT="${PING_TIMEOUT:-3}"
@@ -42,6 +44,8 @@ UPLINK_GW=""
 UPLINK_DEV=""
 VPN_SERVER_IP=""
 VPN_GW=""
+DEFAULT_ROUTE_LOGGED=false
+UPLINK_POLICY_LOGGED=false
 
 LAST_PUBLIC_IP=""
 LAST_PUBLIC_IP_TIME=0
@@ -126,22 +130,66 @@ pin_server_route() {
     fi
 }
 
+setup_uplink_policy() {
+    [ -z "${UPLINK_GW}" ] && return 1
+    [ -z "${UPLINK_DEV}" ] && return 1
+
+    CONTAINER_IP="$(ip -4 addr show "${UPLINK_DEV}" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)"
+    if [ -z "${CONTAINER_IP}" ]; then
+        warn "Cannot detect container IP on ${UPLINK_DEV}, policy routing skipped"
+        return 1
+    fi
+
+    RT_TABLES="/etc/iproute2/rt_tables"
+    if [ ! -f "${RT_TABLES}" ]; then
+        mkdir -p "$(dirname "${RT_TABLES}")"
+        touch "${RT_TABLES}"
+    fi
+
+    TABLE_NAME="original_uplink"
+    TABLE_ID=200
+
+    if ! grep -q "^${TABLE_ID} ${TABLE_NAME}" "${RT_TABLES}" 2>/dev/null; then
+        echo "${TABLE_ID} ${TABLE_NAME}" >> "${RT_TABLES}"
+    fi
+
+    if ! ip route show table "${TABLE_NAME}" | grep -q '^default'; then
+        ip route add default via "${UPLINK_GW}" dev "${UPLINK_DEV}" table "${TABLE_NAME}"
+    fi
+
+    if ! ip rule show | grep -Fq "from ${CONTAINER_IP} lookup ${TABLE_NAME}"; then
+        ip rule add from "${CONTAINER_IP}" lookup "${TABLE_NAME}" priority 1000 >/dev/null 2>&1
+    fi
+
+    if [ "${UPLINK_POLICY_LOGGED}" = false ]; then
+        log "Uplink policy routing configured: from ${CONTAINER_IP} via ${UPLINK_GW} dev ${UPLINK_DEV} table ${TABLE_NAME}"
+        UPLINK_POLICY_LOGGED=true
+    fi
+}
+
 ensure_default_route() {
     [ -z "${VPN_GW}" ] && return 1
+
+    setup_uplink_policy
+
     ip route show | grep '^default' | while read -r route; do
         if echo "$route" | grep -q "dev ${VPN_INTERFACE}\>"; then
             continue
         else
-            log "Removing invalid default route: $route"
+            log "Remove redundant default route: $route"
             ip route del $route 2>/dev/null || true
         fi
     done
     if ip route show | grep '^default' | grep -q "dev ${VPN_INTERFACE}\>"; then
-        existing_gw="$(ip route show | grep '^default' | grep "dev ${VPN_INTERFACE}" | awk '{print $3}' | head -n1)"
-        log "Default route already present via VPN gateway ${existing_gw} dev ${VPN_INTERFACE}"
+        if [ "${DEFAULT_ROUTE_LOGGED}" = false ]; then
+            existing_gw="$(ip route show | grep '^default' | grep "dev ${VPN_INTERFACE}" | awk '{print $3}' | head -n1)"
+            log "Default route present via VPN gateway ${existing_gw} dev ${VPN_INTERFACE}"
+            DEFAULT_ROUTE_LOGGED=true
+        fi
     else
         log "Adding default route via VPN gateway ${VPN_GW} dev ${VPN_INTERFACE}"
         ip route add default via "${VPN_GW}" dev "${VPN_INTERFACE}" 2>/dev/null || true
+        DEFAULT_ROUTE_LOGGED=false
     fi
 }
 
@@ -170,7 +218,8 @@ has_ip() {
 detect_vpn_gateway() {
     VPN_GW="$(ip route | awk "/${VPN_INTERFACE}/ && /default/ {print \$3}" | head -n1)"
     if [ -z "${VPN_GW}" ]; then
-        VPN_GW="$(ip route | awk "/${VPN_INTERFACE}/ && /src/ {print \$1}" | head -n1 | cut -d/ -f1)"
+        err "Unable to detect VPN gateway"
+        return 1
     fi
     if [ -n "${VPN_GW}" ]; then
         log "VPN gateway detected: ${VPN_GW}"
@@ -259,9 +308,6 @@ wait_until_connected() {
     return 1
 }
 
-<<<<<<< Updated upstream
-connect_vpn() {
-=======
 check_vpn_health() {
     if ! is_connected; then
         echo "Connection lost" >&2
@@ -375,50 +421,82 @@ network_setup() {
 }
 
 vpn_connect() {
->>>>>>> Stashed changes
     pin_server_route
     log "Connecting VPN | server=${SE_SERVER} | hub=${SE_HUB}"
     vpn AccountConnect "${ACCOUNT_NAME}" >/dev/null || true
-    wait_until_connected || return 1
-    wait_for_interface || return 1
-    request_dhcp || return 1
-    pin_server_route
-    detect_vpn_gateway
-    if [ -n "${SE_DEFAULTROUTE}" ]; then
-        ensure_default_route
+    if ! wait_until_connected; then
+        err "VPN session establishment failed"
+        return 1
     fi
-    IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" | awk '/inet / {print $2}' | head -n1)"
-    log "VPN connected | ip=${IP_ADDR}"
+    log "VPN session established"
     return 0
 }
 
-disconnect_vpn() {
+vpn_disconnect() {
     warn "Disconnecting VPN"
     vpn AccountDisconnect "${ACCOUNT_NAME}" >/dev/null 2>&1 || true
     sleep 2
 }
 
-reconnect_vpn() {
+vpn_reconnect() {
     warn "Reconnecting VPN"
-    disconnect_vpn
+    vpn_disconnect
     while true; do
-        if connect_vpn; then
+        if vpn_connect && network_setup && vpn_stabilization; then
+            DEFAULT_ROUTE_LOGGED=false
             log "Reconnect successful"
             return 0
         fi
+        warn "Reconnect failed, retry in ${RECONNECT_DELAY}s"
         sleep "${RECONNECT_DELAY}"
     done
 }
 
-log "Starting SoftEther VPN Client | deployment version=${SE_VERSION}"
-if ! vpnclient start >/dev/null 2>&1; then
-    err "Failed to start vpnclient"
-    exit 1
-fi
-sleep 3
+precheck() {
+    log "Running preflight checks"
 
-detect_uplink
-resolve_vpn_server
+    if ! ip link set lo up 2>/dev/null; then
+        err "Insufficient privileges for network management"
+        return 1
+    fi
+
+    check_env || return 1
+
+    for cmd in vpncmd vpnclient ip getent ping awk grep sed udhcpc curl; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            err "Required command not found: $cmd"
+            return 1
+        fi
+    done
+
+    vpnclient start >/dev/null 2>&1 || true
+
+    sleep 3
+
+    if ! vpn NicList >/dev/null 2>&1; then
+        err "vpnclient is not responding"
+        return 1
+    fi
+
+    detect_uplink || return 1
+    resolve_vpn_server || return 1
+
+    ROUTE="$(ip route get "${VPN_SERVER_IP}" 2>/dev/null | head -n1)"
+
+    if [ -z "${ROUTE}" ]; then
+        err "No route to VPN server ${VPN_SERVER_IP}"
+        return 1
+    fi
+
+    log "Route to VPN server: ${ROUTE}"
+    log "Preflight checks passed"
+
+    return 0
+}
+
+log "Starting SoftEther VPN Client | deployment v${SE_VERSION}"
+
+precheck || exit 1
 
 if adapter_exists; then
     log "Adapter exists: ${SE_NICNAME}"
@@ -441,40 +519,14 @@ else
         /TYPE:standard >/dev/null
 fi
 
-until connect_vpn; do
+until vpn_connect; do
     err "Initial connection failed"
     sleep "${RECONNECT_DELAY}"
 done
 
-log "Waiting for tunnel stabilization"
-STABILIZE_START="$(date +%s)"
-LAST_STATE=""
-while true; do
-    NOW="$(date +%s)"
-    ELAPSED=$((NOW - STABILIZE_START))
-    STATE=""
-    if ! is_connected; then
-        STATE="Connection lost"
-    elif ! interface_exists; then
-        STATE="Interface missing"
-    elif ! has_ip; then
-        STATE="Waiting for ip"
-    elif [ -n "${VPN_GW}" ] && ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
-        log "Tunnel stabilized | gateway=${VPN_GW} | elapsed=${ELAPSED}s"
-        break
-    else
-        STATE="Waiting for gateway"
-    fi
-    if [ "${STATE}" != "${LAST_STATE}" ] || [ $((ELAPSED % 30)) -eq 0 ]; then
-        log "Tunnel stabilizing | state=${STATE} | elapsed=${ELAPSED}s"
-        LAST_STATE="${STATE}"
-    fi
-    if [ "${ELAPSED}" -ge "${INITIAL_STABILIZE_TIMEOUT}" ]; then
-        warn "Tunnel stabilization timeout (${INITIAL_STABILIZE_TIMEOUT}s)"
-        break
-    fi
-    sleep "${INITIAL_STABILIZE_INTERVAL}"
-done
+network_setup || vpn_reconnect
+
+vpn_stabilization || vpn_reconnect
 
 log "Healthcheck started"
 
@@ -503,12 +555,7 @@ while true; do
 
         if [ "${FAIL_COUNT}" -ge "${HEALTHCHECK_FAILURES}" ]; then
             warn "Health check failed ${FAIL_COUNT} times, reconnecting"
-<<<<<<< Updated upstream
-            reconnect_vpn
-
-=======
             vpn_reconnect
->>>>>>> Stashed changes
             FAIL_COUNT=0
             LAST_HEALTH_STATE="Healthy"
             sleep "${PING_INTERVAL}"

@@ -281,38 +281,34 @@ wait_until_connected() {
     return 1
 }
 
-connect_vpn() {
+vpn_connect() {
     pin_server_route
     log "Connecting VPN | server=${SE_SERVER} | hub=${SE_HUB}"
     vpn AccountConnect "${ACCOUNT_NAME}" >/dev/null || true
-    wait_until_connected || return 1
-    wait_for_interface || return 1
-    request_dhcp || return 1
-    pin_server_route
-    detect_vpn_gateway
-    if [ -n "${SE_DEFAULTROUTE}" ]; then
-        ensure_default_route
+    if ! wait_until_connected; then
+        err "VPN session establishment failed"
+        return 1
     fi
-    IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" | awk '/inet / {print $2}' | head -n1)"
-    log "VPN connected | ip=${IP_ADDR}"
+    log "VPN session established"
     return 0
 }
 
-disconnect_vpn() {
+vpn_disconnect() {
     warn "Disconnecting VPN"
     vpn AccountDisconnect "${ACCOUNT_NAME}" >/dev/null 2>&1 || true
     sleep 2
 }
 
-reconnect_vpn() {
+vpn_reconnect() {
     warn "Reconnecting VPN"
-    disconnect_vpn
+    vpn_disconnect
     while true; do
-        if connect_vpn; then
+        if vpn_connect; then
             DEFAULT_ROUTE_LOGGED=false
             log "Reconnect successful"
             return 0
         fi
+        warn "Reconnect failed, retry in ${RECONNECT_DELAY}s"
         sleep "${RECONNECT_DELAY}"
     done
 }
@@ -384,7 +380,7 @@ else
         /TYPE:standard >/dev/null
 fi
 
-until connect_vpn; do
+until vpn_connect; do
     err "Initial connection failed"
     sleep "${RECONNECT_DELAY}"
 done
@@ -456,7 +452,7 @@ while true; do
 
         if [ "${FAIL_COUNT}" -ge "${HEALTHCHECK_FAILURES}" ]; then
             warn "Health check failed ${FAIL_COUNT} times, reconnecting"
-            reconnect_vpn
+            vpn_reconnect
 
             FAIL_COUNT=0
             LAST_HEALTH_STATE="Healthy"

@@ -8,14 +8,17 @@
 # reconnect delays, and forcing the VPN default route (SE_DEFAULTROUTE).
 #
 # The script performs the following steps:
-# 1. Starts vpnclient and detects the current uplink (default route).
-# 2. Resolves the VPN server IP and pins a route for it via the uplink.
-# 3. Creates a virtual network adapter and VPN account if missing.
-# 4. Connects to the VPN, obtains an IP via DHCP, and optionally sets the
-#    default route through the VPN interface.
-# 5. Waits for tunnel stabilization (gateway reachable).
-# 6. Runs a health check loop that pings the VPN gateway and reconnects
-#    after consecutive failures.
+# 1. Starts vpnclient and validates runtime prerequisites.
+# 2. Detects the original uplink, resolves the VPN server address,
+#    and pins server traffic to the uplink route.
+# 3. Creates the virtual adapter and VPN account if they do not exist.
+# 4. Establishes the VPN session, acquires network configuration via DHCP,
+#    and optionally enforces VPN default routing with policy-based uplink
+#    preservation.
+# 5. Waits for tunnel stabilization and verifies VPN reachability.
+# 6. Maintains a state-driven health monitor that validates connectivity,
+#    detects route loss, performs local recovery, and reconnects when
+#    recovery is unsuccessful.
 
 set -u
 
@@ -34,6 +37,8 @@ MAX_CONNECT_WAIT="${MAX_CONNECT_WAIT:-60}"
 INITIAL_STABILIZE_TIMEOUT="${INITIAL_STABILIZE_TIMEOUT:-180}"
 INITIAL_STABILIZE_INTERVAL="${INITIAL_STABILIZE_INTERVAL:-10}"
 HEALTHCHECK_FAILURES="${HEALTHCHECK_FAILURES:-6}"
+HEALTH_FAILURE_THRESHOLD="${HEALTH_FAILURE_THRESHOLD:-3}"
+HEALTH_FAILURE_COUNT=0
 
 SE_DEFAULTROUTE="${SE_DEFAULTROUTE:-}"
 
@@ -51,8 +56,17 @@ LAST_PUBLIC_IP=""
 LAST_PUBLIC_IP_TIME=0
 PUBLIC_IP_CACHE_TTL=30
 
+LOG_LEVEL=${LOG_LEVEL:-INFO}
+STATE_FILE="/run/vpn.state"
+STATE="START"
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*"
+}
+
+debug() {
+    [ "${LOG_LEVEL}" = "DEBUG" ] || return 0
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] $*"
 }
 
 warn() {
@@ -99,7 +113,7 @@ detect_uplink() {
         err "Failed to extract gateway or device from default route: ${default_route}"
         return 1
     fi
-    log "Uplink detected: gateway ${UPLINK_GW} dev ${UPLINK_DEV}"
+    debug "Uplink detected: gateway ${UPLINK_GW} dev ${UPLINK_DEV}"
 }
 
 resolve_vpn_server() {
@@ -109,7 +123,7 @@ resolve_vpn_server() {
         err "Unable to resolve VPN server hostname"
         return 1
     fi
-    log "VPN server resolved: ${SERVER_HOST} -> ${VPN_SERVER_IP}"
+    debug "VPN server resolved: ${SERVER_HOST} -> ${VPN_SERVER_IP}"
 }
 
 pin_server_route() {
@@ -124,7 +138,7 @@ pin_server_route() {
     ip route del "${VPN_SERVER_IP}" >/dev/null 2>&1 || true
     if ip route add "${VPN_SERVER_IP}" via "${UPLINK_GW}" dev "${UPLINK_DEV}" >/dev/null 2>&1
     then
-        log "Pinned route: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
+        debug "Pinned route: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
     else
         warn "Failed route pin: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
     fi
@@ -162,7 +176,7 @@ setup_uplink_policy() {
     fi
 
     if [ "${UPLINK_POLICY_LOGGED}" = false ]; then
-        log "Uplink policy routing configured: from ${CONTAINER_IP} via ${UPLINK_GW} dev ${UPLINK_DEV} table ${TABLE_NAME}"
+        debug "Uplink policy routing configured: from ${CONTAINER_IP} via ${UPLINK_GW} dev ${UPLINK_DEV} table ${TABLE_NAME}"
         UPLINK_POLICY_LOGGED=true
     fi
 }
@@ -176,7 +190,7 @@ ensure_default_route() {
         if echo "$route" | grep -q "dev ${VPN_INTERFACE}\>"; then
             continue
         else
-            log "Remove redundant default route: $route"
+            debug "Remove redundant default route: $route"
             ip route del $route 2>/dev/null || true
         fi
     done
@@ -216,14 +230,32 @@ has_ip() {
 }
 
 detect_vpn_gateway() {
-    VPN_GW="$(ip route | awk "/${VPN_INTERFACE}/ && /default/ {print \$3}" | head -n1)"
-    if [ -z "${VPN_GW}" ]; then
-        err "Unable to detect VPN gateway"
+    VPN_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" \
+        | awk '/inet / {print $2}' \
+        | head -n1)"
+
+    if [ -z "${VPN_ADDR}" ]; then
+        err "Unable to detect VPN IP address"
         return 1
     fi
-    if [ -n "${VPN_GW}" ]; then
-        log "VPN gateway detected: ${VPN_GW}"
-    fi
+
+    IP_ONLY="$(echo "${VPN_ADDR}" | cut -d/ -f1)"
+    PREFIX="$(echo "${VPN_ADDR}" | cut -d/ -f2)"
+
+    case "${PREFIX}" in
+        24)
+            VPN_GW="$(echo "${IP_ONLY}" | awk -F. '{print $1"."$2"."$3".1"}')"
+            ;;
+        16)
+            VPN_GW="$(echo "${IP_ONLY}" | awk -F. '{print $1"."$2".0.1"}')"
+            ;;
+        *)
+            err "Unsupported VPN subnet mask: /${PREFIX}"
+            return 1
+            ;;
+    esac
+
+    debug "VPN gateway detected: ${VPN_GW} (from ${VPN_ADDR})"
 }
 
 vpn_public_ip() {
@@ -266,7 +298,7 @@ request_dhcp() {
         return 0
     fi
 
-    log "Requesting DHCP lease"
+    debug "Requesting DHCP lease"
 
     DHCP_OUTPUT="$(udhcpc -i "${VPN_INTERFACE}" -q -n 2>&1)"
     DHCP_EXIT=$?
@@ -283,7 +315,7 @@ request_dhcp() {
 
     if has_ip; then
         IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" | awk '/inet / {print $2}' | head -n1)"
-        log "DHCP assigned IP: ${IP_ADDR}"
+        debug "DHCP assigned IP: ${IP_ADDR}"
         return 0
     fi
 
@@ -308,27 +340,48 @@ wait_until_connected() {
     return 1
 }
 
-check_vpn_health() {
+check_vpn_fast_health() {
     if ! is_connected; then
         echo "Connection lost" >&2
         return 1
     fi
+
     if ! interface_exists; then
         echo "Interface missing" >&2
         return 1
     fi
+
     if ! has_ip; then
         echo "IP address missing" >&2
         return 1
     fi
+
     if [ -z "${VPN_GW}" ]; then
         detect_vpn_gateway || {
             echo "Gateway missing" >&2
             return 1
         }
     fi
-    if ! ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
+
+    if ! ping -c 2 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
         echo "Gateway unreachable" >&2
+        return 1
+    fi
+
+    if [ -n "${SE_DEFAULTROUTE}" ]; then
+        if ! ip route show default \
+            | grep -q "default via ${VPN_GW} dev ${VPN_INTERFACE}"; then
+
+            echo "Default route missing via VPN" >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+check_vpn_health() {
+    if ! check_vpn_fast_health; then
         return 1
     fi
 
@@ -347,8 +400,16 @@ check_vpn_health() {
     return 0
 }
 
+set_state() {
+    if [ "${STATE}" != "$1" ]; then
+        debug "State transition: ${STATE} -> $1"
+        STATE="$1"
+        echo "$1" > "${STATE_FILE}"
+    fi
+}
+
 vpn_stabilization() {
-    log "Waiting for tunnel stabilization"
+    debug "Waiting for tunnel stabilization"
     STABILIZE_START="$(date +%s)"
     LAST_STATE=""
     while true; do
@@ -357,7 +418,7 @@ vpn_stabilization() {
 
         if check_vpn_health >/dev/null 2>&1; then
             PUBLIC_IP="${LAST_PUBLIC_IP}"
-            log "VPN public IP detected: ${PUBLIC_IP}"
+            debug "VPN public IP detected: ${PUBLIC_IP}"
             if [ -n "${VPN_SERVER_IP}" ] && [ "${PUBLIC_IP}" != "${VPN_SERVER_IP}" ]; then
                 warn "VPN public IP (${PUBLIC_IP}) differs from VPN server IP (${VPN_SERVER_IP})"
             fi
@@ -395,11 +456,13 @@ local_recovery() {
     if [ -n "${SE_DEFAULTROUTE}" ]; then
         ensure_default_route
     fi
-    if check_vpn_health >/dev/null 2>&1; then
+    HEALTH_REASON="$(check_vpn_fast_health 2>&1)"
+    HEALTH_OK=$?
+    if [ ${HEALTH_OK} -eq 0 ]; then
         log "Local recovery successful"
         return 0
     else
-        REASON="$(check_vpn_health 2>&1 >/dev/null | head -n1)"
+        REASON="$(echo "${HEALTH_REASON}" | head -n1)"
         warn "Local recovery failed: ${REASON}"
         return 1
     fi
@@ -407,17 +470,22 @@ local_recovery() {
 
 network_setup() {
     wait_for_interface || return 1
+
     request_dhcp || return 1
+
     detect_vpn_gateway || return 1
+
+    pin_server_route
+
     if [ -n "${SE_DEFAULTROUTE}" ]; then
         ensure_default_route
     fi
-    pin_server_route
+
     IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" \
         | awk '/inet / {print $2}' \
         | head -n1)"
+
     log "VPN network ready | ip=${IP_ADDR} | gateway=${VPN_GW}"
-    return 0
 }
 
 vpn_connect() {
@@ -434,26 +502,33 @@ vpn_connect() {
 
 vpn_disconnect() {
     warn "Disconnecting VPN"
+
     vpn AccountDisconnect "${ACCOUNT_NAME}" >/dev/null 2>&1 || true
+
+    VPN_GW=""
+    LAST_PUBLIC_IP=""
+    LAST_PUBLIC_IP_TIME=0
+
+    ip addr flush dev "${VPN_INTERFACE}" >/dev/null 2>&1 || true
+
     sleep 2
 }
 
 vpn_reconnect() {
     warn "Reconnecting VPN"
+
+    VPN_GW=""
+    LAST_PUBLIC_IP=""
+    LAST_PUBLIC_IP_TIME=0
+    DEFAULT_ROUTE_LOGGED=false
+
     vpn_disconnect
-    while true; do
-        if vpn_connect && network_setup && vpn_stabilization; then
-            DEFAULT_ROUTE_LOGGED=false
-            log "Reconnect successful"
-            return 0
-        fi
-        warn "Reconnect failed, retry in ${RECONNECT_DELAY}s"
-        sleep "${RECONNECT_DELAY}"
-    done
+
+    return 0
 }
 
 precheck() {
-    log "Running preflight checks"
+    debug "Running preflight checks"
 
     if ! ip link set lo up 2>/dev/null; then
         err "Insufficient privileges for network management"
@@ -488,7 +563,7 @@ precheck() {
         return 1
     fi
 
-    log "Route to VPN server: ${ROUTE}"
+    debug "Route to VPN server: ${ROUTE}"
     log "Preflight checks passed"
 
     return 0
@@ -499,16 +574,16 @@ log "Starting SoftEther VPN Client | deployment v${SE_VERSION}"
 precheck || exit 1
 
 if adapter_exists; then
-    log "Adapter exists: ${SE_NICNAME}"
+    debug "Adapter exists: ${SE_NICNAME}"
 else
-    log "Creating adapter: ${SE_NICNAME}"
+    debug "Creating adapter: ${SE_NICNAME}"
     vpn NicCreate "${SE_NICNAME}" >/dev/null
 fi
 
 if account_exists; then
-    log "VPN account exists: ${ACCOUNT_NAME}"
+    debug "VPN account exists: ${ACCOUNT_NAME}"
 else
-    log "Creating VPN account"
+    debug "Creating VPN account"
     vpn AccountCreate "${ACCOUNT_NAME}" \
         /SERVER:"${SE_SERVER}" \
         /HUB:"${SE_HUB}" \
@@ -519,49 +594,83 @@ else
         /TYPE:standard >/dev/null
 fi
 
-until vpn_connect; do
-    err "Initial connection failed"
-    sleep "${RECONNECT_DELAY}"
-done
+set_state CONNECT
 
-network_setup || vpn_reconnect
-
-vpn_stabilization || vpn_reconnect
-
-log "Healthcheck started"
-
-FAIL_COUNT=0
-LAST_HEALTH_STATE="Healthy"
+debug "Starting VPN state machine"
 
 while true; do
-    if check_vpn_health >/dev/null 2>&1; then
-        if [ "${LAST_HEALTH_STATE}" != "Healthy" ]; then
-            log "Connection restored"
-        fi
-        FAIL_COUNT=0
-        LAST_HEALTH_STATE="Healthy"
-        if [ -n "${SE_DEFAULTROUTE}" ]; then
-            ensure_default_route
-        fi
-        pin_server_route
-    else
-        REASON="$(check_vpn_health 2>&1 >/dev/null | head -n1)"
-        if [ "${REASON}" != "${LAST_HEALTH_STATE}" ]; then
-            FAIL_COUNT=1
-            err "${REASON}"
-        else
-            FAIL_COUNT=$((FAIL_COUNT + 1))
-        fi
 
-        if [ "${FAIL_COUNT}" -ge "${HEALTHCHECK_FAILURES}" ]; then
-            warn "Health check failed ${FAIL_COUNT} times, reconnecting"
-            vpn_reconnect
-            FAIL_COUNT=0
-            LAST_HEALTH_STATE="Healthy"
-            sleep "${PING_INTERVAL}"
-            continue
-        fi
-        LAST_HEALTH_STATE="${REASON}"
-    fi
-    sleep "${PING_INTERVAL}"
+    case "${STATE}" in
+
+        CONNECT)
+            if vpn_connect; then
+                set_state STABILIZE
+            else
+                err "Connect failed"
+                sleep "${RECONNECT_DELAY}"
+            fi
+            ;;
+
+
+        STABILIZE)
+            if network_setup && vpn_stabilization; then
+                set_state HEALTHY
+                log "VPN operational"
+            else
+                warn "Stabilization failed"
+                set_state RECONNECT
+            fi
+            ;;
+
+
+        HEALTHY)
+            if check_vpn_fast_health >/dev/null 2>&1; then
+                if [ "${HEALTH_FAILURE_COUNT}" -gt 0 ]; then
+                    log "Health recovered after ${HEALTH_FAILURE_COUNT} failures"
+                fi
+
+                HEALTH_FAILURE_COUNT=0
+                sleep "${PING_INTERVAL}"
+            else
+                HEALTH_FAILURE_COUNT=$((HEALTH_FAILURE_COUNT + 1))
+
+                warn "Health check failed ${HEALTH_FAILURE_COUNT}/${HEALTH_FAILURE_THRESHOLD}"
+
+                if [ "${HEALTH_FAILURE_COUNT}" -ge "${HEALTH_FAILURE_THRESHOLD}" ]; then
+                    warn "Health degradation threshold reached"
+                    HEALTH_FAILURE_COUNT=0
+                    set_state DEGRADED
+                else
+                    sleep "${PING_INTERVAL}"
+                fi
+            fi
+            ;;
+
+
+        DEGRADED)
+            if local_recovery; then
+                set_state HEALTHY
+                log "VPN operational"
+            else
+                set_state RECONNECT
+            fi
+            ;;
+
+
+        RECONNECT)
+            if vpn_reconnect; then
+                set_state CONNECT
+            else
+                sleep "${RECONNECT_DELAY}"
+            fi
+        ;;
+
+
+        *)
+            err "Unknown state: ${STATE}"
+            exit 1
+            ;;
+
+    esac
+
 done

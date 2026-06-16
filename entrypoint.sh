@@ -47,6 +47,10 @@ VPN_GW=""
 DEFAULT_ROUTE_LOGGED=false
 UPLINK_POLICY_LOGGED=false
 
+LAST_PUBLIC_IP=""
+LAST_PUBLIC_IP_TIME=0
+PUBLIC_IP_CACHE_TTL=30
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*"
 }
@@ -222,6 +226,28 @@ detect_vpn_gateway() {
     fi
 }
 
+vpn_public_ip() {
+    PUBLIC_IP="$(
+        curl -4 \
+             --interface "${VPN_INTERFACE}" \
+             -s \
+             --max-time 10 \
+             https://ifconfig.me/ip \
+             2>/dev/null || true
+    )"
+
+    if [ -z "${PUBLIC_IP}" ]; then
+        return 1
+    fi
+
+    echo "${PUBLIC_IP}" \
+        | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+        || return 1
+
+    echo "${PUBLIC_IP}"
+    return 0
+}
+
 wait_for_interface() {
     i=0
     while [ "$i" -lt 20 ]; do
@@ -282,84 +308,101 @@ wait_until_connected() {
     return 1
 }
 
+check_vpn_health() {
+    if ! is_connected; then
+        echo "Connection lost" >&2
+        return 1
+    fi
+    if ! interface_exists; then
+        echo "Interface missing" >&2
+        return 1
+    fi
+    if ! has_ip; then
+        echo "IP address missing" >&2
+        return 1
+    fi
+    if [ -z "${VPN_GW}" ]; then
+        detect_vpn_gateway || {
+            echo "Gateway missing" >&2
+            return 1
+        }
+    fi
+    if ! ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
+        echo "Gateway unreachable" >&2
+        return 1
+    fi
+
+    NOW="$(date +%s)"
+    if [ -z "${LAST_PUBLIC_IP}" ] || [ $((NOW - LAST_PUBLIC_IP_TIME)) -ge ${PUBLIC_IP_CACHE_TTL} ]; then
+        PUBLIC_IP="$(vpn_public_ip 2>/dev/null || true)"
+        if [ -n "${PUBLIC_IP}" ] && echo "${PUBLIC_IP}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            LAST_PUBLIC_IP="${PUBLIC_IP}"
+            LAST_PUBLIC_IP_TIME="${NOW}"
+        else
+            echo "Public IP not available" >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 vpn_stabilization() {
     log "Waiting for tunnel stabilization"
-
     STABILIZE_START="$(date +%s)"
     LAST_STATE=""
-    PUBLIC_IP=""
-
     while true; do
         NOW="$(date +%s)"
         ELAPSED=$((NOW - STABILIZE_START))
 
-        STATE=""
-
-        if ! is_connected; then
-            STATE="Connection lost"
-
-        elif ! interface_exists; then
-            STATE="Interface missing"
-
-        elif ! has_ip; then
-            STATE="Waiting for ip"
-
-        elif [ -z "${VPN_GW}" ]; then
-            STATE="Gateway missing"
-
-        elif ! ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
-            STATE="Waiting for gateway"
-
-        else
-            PUBLIC_IP="$(
-                curl -4 \
-                     --interface "${VPN_INTERFACE}" \
-                     -s \
-                     --max-time 10 \
-                     https://ifconfig.me/ip \
-                     2>/dev/null || true
-            )"
-
-            if [ -z "${PUBLIC_IP}" ]; then
-                STATE="Waiting for public ip"
-
-            elif ! echo "${PUBLIC_IP}" | grep -Eq \
-                '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
-            then
-                warn "Invalid public IP response: ${PUBLIC_IP}"
-                STATE="Invalid public ip"
-            else
-                break
+        if check_vpn_health >/dev/null 2>&1; then
+            PUBLIC_IP="${LAST_PUBLIC_IP}"
+            log "VPN public IP detected: ${PUBLIC_IP}"
+            if [ -n "${VPN_SERVER_IP}" ] && [ "${PUBLIC_IP}" != "${VPN_SERVER_IP}" ]; then
+                warn "VPN public IP (${PUBLIC_IP}) differs from VPN server IP (${VPN_SERVER_IP})"
             fi
+            log "Tunnel stabilized | gateway=${VPN_GW} | public_ip=${PUBLIC_IP} | elapsed=${ELAPSED}s"
+            return 0
         fi
 
-        NOW="$(date +%s)"
-        ELAPSED=$((NOW - STABILIZE_START))
-
-        if [ "${STATE}" != "${LAST_STATE}" ] \
-           || [ $((ELAPSED % 30)) -eq 0 ]; then
-            log "Tunnel stabilizing | state=${STATE} | elapsed=${ELAPSED}s"
-            LAST_STATE="${STATE}"
+        REASON="$(check_vpn_health 2>&1 >/dev/null | head -n1)"
+        if [ "${REASON}" != "${LAST_STATE}" ] || [ $((ELAPSED % 30)) -eq 0 ]; then
+            log "Tunnel stabilizing | state=${REASON} | elapsed=${ELAPSED}s"
+            LAST_STATE="${REASON}"
         fi
 
         if [ "${ELAPSED}" -ge "${INITIAL_STABILIZE_TIMEOUT}" ]; then
-            warn "Tunnel stabilization timeout | last_state=${STATE} | elapsed=${ELAPSED}s"
+            warn "Tunnel stabilization timeout | last_state=${LAST_STATE} | elapsed=${ELAPSED}s"
             return 1
         fi
 
         sleep "${INITIAL_STABILIZE_INTERVAL}"
     done
+}
 
-    log "VPN public IP detected: ${PUBLIC_IP}"
-
-    if [ -n "${VPN_SERVER_IP}" ] \
-       && [ "${PUBLIC_IP}" != "${VPN_SERVER_IP}" ]; then
-        warn "VPN public IP (${PUBLIC_IP}) differs from VPN server IP (${VPN_SERVER_IP})"
+local_recovery() {
+    warn "Attempting local recovery"
+    pin_server_route
+    if ! interface_exists; then
+        warn "VPN interface missing"
+        return 1
     fi
-
-    log "Tunnel stabilized | gateway=${VPN_GW} | public_ip=${PUBLIC_IP} | elapsed=${ELAPSED}s"
-
-    return 0
+    if ! has_ip; then
+        warn "IP address lost, requesting DHCP"
+        request_dhcp || return 1
+    fi
+    detect_vpn_gateway || return 1
+    if [ -n "${SE_DEFAULTROUTE}" ]; then
+        ensure_default_route
+    fi
+    if check_vpn_health >/dev/null 2>&1; then
+        log "Local recovery successful"
+        return 0
+    else
+        REASON="$(check_vpn_health 2>&1 >/dev/null | head -n1)"
+        warn "Local recovery failed: ${REASON}"
+        return 1
+    fi
 }
 
 network_setup() {
@@ -491,61 +534,34 @@ FAIL_COUNT=0
 LAST_HEALTH_STATE="Healthy"
 
 while true; do
-    CURRENT_STATE="Healthy"
-
-    if ! is_connected; then
-        CURRENT_STATE="Connection lost"
-    elif ! interface_exists; then
-        CURRENT_STATE="Interface missing"
-    elif ! has_ip; then
-        CURRENT_STATE="IP address lost"
-    elif [ -n "${VPN_GW}" ] && ! ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
-        CURRENT_STATE="Gateway unreachable"
-    fi
-
-    if [ "${CURRENT_STATE}" != "Healthy" ]; then
-
-        if [ "${CURRENT_STATE}" != "${LAST_HEALTH_STATE}" ]; then
+    if check_vpn_health >/dev/null 2>&1; then
+        if [ "${LAST_HEALTH_STATE}" != "Healthy" ]; then
+            log "Connection restored"
+        fi
+        FAIL_COUNT=0
+        LAST_HEALTH_STATE="Healthy"
+        if [ -n "${SE_DEFAULTROUTE}" ]; then
+            ensure_default_route
+        fi
+        pin_server_route
+    else
+        REASON="$(check_vpn_health 2>&1 >/dev/null | head -n1)"
+        if [ "${REASON}" != "${LAST_HEALTH_STATE}" ]; then
             FAIL_COUNT=1
-            err "${CURRENT_STATE}"
+            err "${REASON}"
         else
             FAIL_COUNT=$((FAIL_COUNT + 1))
-        fi
-
-        if [ "${CURRENT_STATE}" = "Gateway unreachable" ] \
-           && [ "${FAIL_COUNT}" -eq "${HEALTHCHECK_FAILURES}" ]; then
-            warn "VPN status dump:"
-            vpn AccountStatusGet "${ACCOUNT_NAME}" | while IFS= read -r line; do
-                warn "  ${line}"
-            done
         fi
 
         if [ "${FAIL_COUNT}" -ge "${HEALTHCHECK_FAILURES}" ]; then
             warn "Health check failed ${FAIL_COUNT} times, reconnecting"
             vpn_reconnect
-
             FAIL_COUNT=0
             LAST_HEALTH_STATE="Healthy"
-
             sleep "${PING_INTERVAL}"
             continue
         fi
-
-    else
-
-        if [ "${LAST_HEALTH_STATE}" != "Healthy" ]; then
-            log "Connection restored"
-        fi
-
-        FAIL_COUNT=0
-
-        if [ -n "${SE_DEFAULTROUTE}" ]; then
-            ensure_default_route
-        fi
-
-        pin_server_route
+        LAST_HEALTH_STATE="${REASON}"
     fi
-
-    LAST_HEALTH_STATE="${CURRENT_STATE}"
     sleep "${PING_INTERVAL}"
 done

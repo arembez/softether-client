@@ -214,7 +214,8 @@ has_ip() {
 detect_vpn_gateway() {
     VPN_GW="$(ip route | awk "/${VPN_INTERFACE}/ && /default/ {print \$3}" | head -n1)"
     if [ -z "${VPN_GW}" ]; then
-        VPN_GW="$(ip route | awk "/${VPN_INTERFACE}/ && /src/ {print \$1}" | head -n1 | cut -d/ -f1)"
+        err "Unable to detect VPN gateway"
+        return 1
     fi
     if [ -n "${VPN_GW}" ]; then
         log "VPN gateway detected: ${VPN_GW}"
@@ -281,6 +282,21 @@ wait_until_connected() {
     return 1
 }
 
+network_setup() {
+    wait_for_interface || return 1
+    request_dhcp || return 1
+    detect_vpn_gateway || return 1
+    if [ -n "${SE_DEFAULTROUTE}" ]; then
+        ensure_default_route
+    fi
+    pin_server_route
+    IP_ADDR="$(ip -4 addr show "${VPN_INTERFACE}" \
+        | awk '/inet / {print $2}' \
+        | head -n1)"
+    log "VPN network ready | ip=${IP_ADDR} | gateway=${VPN_GW}"
+    return 0
+}
+
 vpn_connect() {
     pin_server_route
     log "Connecting VPN | server=${SE_SERVER} | hub=${SE_HUB}"
@@ -303,7 +319,7 @@ vpn_reconnect() {
     warn "Reconnecting VPN"
     vpn_disconnect
     while true; do
-        if vpn_connect; then
+        if vpn_connect && network_setup; then
             DEFAULT_ROUTE_LOGGED=false
             log "Reconnect successful"
             return 0
@@ -384,6 +400,8 @@ until vpn_connect; do
     err "Initial connection failed"
     sleep "${RECONNECT_DELAY}"
 done
+
+network_setup || vpn_reconnect
 
 log "Waiting for tunnel stabilization"
 STABILIZE_START="$(date +%s)"

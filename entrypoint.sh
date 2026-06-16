@@ -282,6 +282,86 @@ wait_until_connected() {
     return 1
 }
 
+vpn_stabilization() {
+    log "Waiting for tunnel stabilization"
+
+    STABILIZE_START="$(date +%s)"
+    LAST_STATE=""
+    PUBLIC_IP=""
+
+    while true; do
+        NOW="$(date +%s)"
+        ELAPSED=$((NOW - STABILIZE_START))
+
+        STATE=""
+
+        if ! is_connected; then
+            STATE="Connection lost"
+
+        elif ! interface_exists; then
+            STATE="Interface missing"
+
+        elif ! has_ip; then
+            STATE="Waiting for ip"
+
+        elif [ -z "${VPN_GW}" ]; then
+            STATE="Gateway missing"
+
+        elif ! ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
+            STATE="Waiting for gateway"
+
+        else
+            PUBLIC_IP="$(
+                curl -4 \
+                     --interface "${VPN_INTERFACE}" \
+                     -s \
+                     --max-time 10 \
+                     https://ifconfig.me/ip \
+                     2>/dev/null || true
+            )"
+
+            if [ -z "${PUBLIC_IP}" ]; then
+                STATE="Waiting for public ip"
+
+            elif ! echo "${PUBLIC_IP}" | grep -Eq \
+                '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+            then
+                warn "Invalid public IP response: ${PUBLIC_IP}"
+                STATE="Invalid public ip"
+            else
+                break
+            fi
+        fi
+
+        NOW="$(date +%s)"
+        ELAPSED=$((NOW - STABILIZE_START))
+
+        if [ "${STATE}" != "${LAST_STATE}" ] \
+           || [ $((ELAPSED % 30)) -eq 0 ]; then
+            log "Tunnel stabilizing | state=${STATE} | elapsed=${ELAPSED}s"
+            LAST_STATE="${STATE}"
+        fi
+
+        if [ "${ELAPSED}" -ge "${INITIAL_STABILIZE_TIMEOUT}" ]; then
+            warn "Tunnel stabilization timeout | last_state=${STATE} | elapsed=${ELAPSED}s"
+            return 1
+        fi
+
+        sleep "${INITIAL_STABILIZE_INTERVAL}"
+    done
+
+    log "VPN public IP detected: ${PUBLIC_IP}"
+
+    if [ -n "${VPN_SERVER_IP}" ] \
+       && [ "${PUBLIC_IP}" != "${VPN_SERVER_IP}" ]; then
+        warn "VPN public IP (${PUBLIC_IP}) differs from VPN server IP (${VPN_SERVER_IP})"
+    fi
+
+    log "Tunnel stabilized | gateway=${VPN_GW} | public_ip=${PUBLIC_IP} | elapsed=${ELAPSED}s"
+
+    return 0
+}
+
 network_setup() {
     wait_for_interface || return 1
     request_dhcp || return 1
@@ -319,7 +399,7 @@ vpn_reconnect() {
     warn "Reconnecting VPN"
     vpn_disconnect
     while true; do
-        if vpn_connect && network_setup; then
+        if vpn_connect && network_setup && vpn_stabilization; then
             DEFAULT_ROUTE_LOGGED=false
             log "Reconnect successful"
             return 0
@@ -339,7 +419,7 @@ precheck() {
 
     check_env || return 1
 
-    for cmd in vpncmd vpnclient ip getent ping awk grep sed udhcpc; do
+    for cmd in vpncmd vpnclient ip getent ping awk grep sed udhcpc curl; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             err "Required command not found: $cmd"
             return 1
@@ -403,35 +483,7 @@ done
 
 network_setup || vpn_reconnect
 
-log "Waiting for tunnel stabilization"
-STABILIZE_START="$(date +%s)"
-LAST_STATE=""
-while true; do
-    NOW="$(date +%s)"
-    ELAPSED=$((NOW - STABILIZE_START))
-    STATE=""
-    if ! is_connected; then
-        STATE="Connection lost"
-    elif ! interface_exists; then
-        STATE="Interface missing"
-    elif ! has_ip; then
-        STATE="Waiting for ip"
-    elif [ -n "${VPN_GW}" ] && ping -c 4 -W "${PING_TIMEOUT}" "${VPN_GW}" >/dev/null 2>&1; then
-        log "Tunnel stabilized | gateway=${VPN_GW} | elapsed=${ELAPSED}s"
-        break
-    else
-        STATE="Waiting for gateway"
-    fi
-    if [ "${STATE}" != "${LAST_STATE}" ] || [ $((ELAPSED % 30)) -eq 0 ]; then
-        log "Tunnel stabilizing | state=${STATE} | elapsed=${ELAPSED}s"
-        LAST_STATE="${STATE}"
-    fi
-    if [ "${ELAPSED}" -ge "${INITIAL_STABILIZE_TIMEOUT}" ]; then
-        warn "Tunnel stabilization timeout (${INITIAL_STABILIZE_TIMEOUT}s)"
-        break
-    fi
-    sleep "${INITIAL_STABILIZE_INTERVAL}"
-done
+vpn_stabilization || vpn_reconnect
 
 log "Healthcheck started"
 

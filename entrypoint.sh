@@ -19,11 +19,13 @@
 
 set -u
 
-: "${SE_SERVER:?missing SE_SERVER}"
-: "${SE_HUB:?missing SE_HUB}"
-: "${SE_NICNAME:?missing SE_NICNAME}"
-: "${SE_USERNAME:?missing SE_USERNAME}"
-: "${SE_PASSWORD:?missing SE_PASSWORD}"
+check_env() {
+    : "${SE_SERVER:?missing SE_SERVER}"
+    : "${SE_HUB:?missing SE_HUB}"
+    : "${SE_NICNAME:?missing SE_NICNAME}"
+    : "${SE_USERNAME:?missing SE_USERNAME}"
+    : "${SE_PASSWORD:?missing SE_PASSWORD}"
+}
 
 PING_INTERVAL="${PING_INTERVAL:-10}"
 PING_TIMEOUT="${PING_TIMEOUT:-3}"
@@ -315,15 +317,51 @@ reconnect_vpn() {
     done
 }
 
-log "Starting SoftEther VPN Client | deployment v${SE_VERSION}"
-if ! vpnclient start >/dev/null 2>&1; then
-    err "Failed to start vpnclient"
-    exit 1
-fi
-sleep 3
+precheck() {
+    log "Running preflight checks"
 
-detect_uplink || exit 1
-resolve_vpn_server || exit 1
+    if ! ip link set lo up 2>/dev/null; then
+        err "Insufficient privileges for network management"
+        return 1
+    fi
+
+    check_env || return 1
+
+    for cmd in vpncmd vpnclient ip getent ping awk grep sed udhcpc; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            err "Required command not found: $cmd"
+            return 1
+        fi
+    done
+
+    vpnclient start >/dev/null 2>&1 || true
+
+    sleep 3
+
+    if ! vpn NicList >/dev/null 2>&1; then
+        err "vpnclient is not responding"
+        return 1
+    fi
+
+    detect_uplink || return 1
+    resolve_vpn_server || return 1
+
+    ROUTE="$(ip route get "${VPN_SERVER_IP}" 2>/dev/null | head -n1)"
+
+    if [ -z "${ROUTE}" ]; then
+        err "No route to VPN server ${VPN_SERVER_IP}"
+        return 1
+    fi
+
+    log "Route to VPN server: ${ROUTE}"
+    log "Preflight checks passed"
+
+    return 0
+}
+
+log "Starting SoftEther VPN Client | deployment v${SE_VERSION}"
+
+precheck || exit 1
 
 if adapter_exists; then
     log "Adapter exists: ${SE_NICNAME}"

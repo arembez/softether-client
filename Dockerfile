@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM --platform=$TARGETPLATFORM softethervpn/vpnclient:latest
 
-ENV SE_VERSION=0.9.5
+ENV SE_VERSION=0.9.6
 
 RUN apk add --no-cache curl
 

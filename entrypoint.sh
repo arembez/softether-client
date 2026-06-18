@@ -40,6 +40,10 @@ HEALTHCHECK_FAILURES="${HEALTHCHECK_FAILURES:-6}"
 HEALTH_FAILURE_THRESHOLD="${HEALTH_FAILURE_THRESHOLD:-3}"
 HEALTH_FAILURE_COUNT=0
 
+USER_COMMAND="$@"
+USER_COMMAND_PID=""
+USER_COMMAND_EXECUTED="false"
+
 SE_DEFAULTROUTE="${SE_DEFAULTROUTE:-}"
 
 ACCOUNT_NAME="${SE_NICNAME}"
@@ -79,6 +83,10 @@ err() {
 
 cleanup() {
     warn "Shutdown signal received"
+    if [ -n "${USER_COMMAND_PID}" ] && kill -0 "${USER_COMMAND_PID}" 2>/dev/null; then
+        kill -TERM "${USER_COMMAND_PID}" 2>/dev/null || true
+        wait "${USER_COMMAND_PID}" 2>/dev/null || true
+    fi
     vpn AccountDisconnect "${ACCOUNT_NAME}" >/dev/null 2>&1 || true
     vpnclient stop >/dev/null 2>&1 || true
     exit 0
@@ -141,6 +149,27 @@ pin_server_route() {
         debug "Pinned route: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
     else
         warn "Failed route pin: ${VPN_SERVER_IP} via ${UPLINK_DEV}"
+    fi
+}
+
+execute_user_command() {
+    if [ -n "${USER_COMMAND}" ] && [ "${USER_COMMAND_EXECUTED}" = "false" ]; then
+        local cmd_name
+
+        cmd_name=$(printf '%s\n' "${USER_COMMAND}" | awk '{print $1}')
+        cmd_name=$(basename "${cmd_name}")
+
+        debug "Executing user command: ${USER_COMMAND}"
+
+        (
+            eval "${USER_COMMAND}" 2>&1 |
+            while IFS= read -r line; do
+                log "${cmd_name} | ${line}"
+            done
+        ) &
+
+        USER_COMMAND_PID=$!
+        USER_COMMAND_EXECUTED="true"
     fi
 }
 
@@ -616,6 +645,7 @@ while true; do
             if network_setup && vpn_stabilization; then
                 set_state HEALTHY
                 log "VPN operational"
+                execute_user_command
             else
                 warn "Stabilization failed"
                 set_state RECONNECT
